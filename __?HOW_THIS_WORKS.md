@@ -439,3 +439,258 @@ no networking. `rtl_tcp://` is only for reading from a dongle attached to a
 **remote machine** over TCP. The dongle is always a USB device; `rtl_tcp` just
 relays its samples across a TCP link when the dongle isn't on the same computer
 as rtl_433.
+
+---
+
+## Q9: How does it work in general — what data is retrieved from the SDR dongle? Is it ones and zeros, and then the program figures out what encoding was used?
+
+What comes off the dongle is **not** digital bits. It's a stream of numbers
+measuring the radio wave itself, and the program goes through several stages
+before it even *gets* ones and zeros — then more stages to figure out the
+encoding.
+
+### What the dongle actually sends: IQ samples (not bits)
+The RTL-SDR gives you **IQ samples** — a firehose of raw measurements of the
+radio signal's amplitude and phase, ~250,000 times per second. Each sample is a
+pair of bytes:
+- **I** = in-phase component
+- **Q** = quadrature component
+
+Together `(I, Q)` describe a point on the radio wave at one instant — a vector
+with a **magnitude** (signal strength) and an **angle** (phase). On RTL-SDR these
+arrive as **CU8** (two unsigned 8-bit bytes per sample; `demod->sample_size = 2`).
+No meaning attached yet — just the digitized wiggling of the airwaves.
+
+### The journey from IQ numbers to a decoded message (5 stages)
+```
+1. IQ samples        raw (I,Q) number pairs from the dongle
+      │  demodulation
+2. Amplitude/freq    "how loud" (AM) or "what frequency" (FM) at each instant
+      │  pulse detection / slicing
+3. Pulses & gaps     timing: "pulse 500µs, gap 1000µs, pulse 500µs, ..."
+      │  line-code decoding
+4. Bits              0s and 1s, finally
+      │  protocol decoding
+5. Decoded message   "Acurite sensor, 21.3°C, 55% humidity, battery OK"
+```
+
+- **Stage 1→2 Demodulation:** OOK/ASK devices switch the carrier on/off → compute
+  **amplitude** (AM). FSK devices shift between two frequencies → compute
+  instantaneous **frequency** (FM). Hence `run_ook_demods` and `run_fsk_demods`.
+- **Stage 2→3 Pulse detection:** `pulse_detect_package()` finds edges and emits
+  pure **timing** (pulse/gap durations). **Still no bits** — info lives in the
+  durations.
+- **Stage 3→4 Line-code decoding:** a short vs long pulse/gap encodes 0/1, but
+  *how* depends on the line code (PWM, PPM, Manchester, NRZ, …) — the
+  `pulse_slicer_*` functions in `src/pulse_slicer.c`.
+- **Stage 4→5 Protocol decoding:** each decoder in `src/devices/*.c` checks a
+  preamble, bit length, and **CRC**; if it matches, it extracts the fields.
+
+### Direct answer
+1. **The dongle does not give ones and zeros.** It gives **IQ samples** — raw
+   numeric measurements of the wave (amplitude + phase). The bits don't exist
+   yet; they're buried in the *timing* and must be reconstructed.
+2. **Yes, the program must figure out the encoding — at every layer, largely by
+   brute force.** It doesn't know in advance whether a device is **OOK or FSK**
+   (tries both), which **line code** maps pulses to bits (each decoder knows its
+   own), or which **protocol** the bits belong to (runs the bits past all ~250
+   decoders and keeps whichever one's **CRC checks out**). That's why it can
+   receive hundreds of unrelated device types on one frequency at once.
+
+Mental model: the dongle is an **oscilloscope for the airwaves**; rtl_433 is the
+detective that reconstructs timing → bits → meaning, trying every known
+"language" until a checksum confirms a match.
+
+---
+
+## Q10: Do I understand correctly — the program gets raw data about the wave, then tries to figure out the modulation, and once modulation is figured out it can get ones and zeros?
+
+The core sequence is right, with one important correction.
+
+### What's right
+1. It gets **raw data about the wave** (IQ samples). ✅
+2. It must deal with **modulation** before getting ones and zeros. ✅
+3. Once past the modulation layer, it reconstructs the **bits**. ✅
+
+### Correction: it doesn't "figure out" the modulation — it tries both
+rtl_433 does **not** analyze the wave and detect "this is OOK" or "this is FSK."
+It **demodulates both ways in parallel** and lets later stages decide which
+produced something valid:
+- **AM demodulation** → feeds **OOK** decoders (`run_ook_demods`)
+- **FM demodulation** → feeds **FSK** decoders (`run_fsk_demods`)
+
+The wrong interpretation just yields garbage that no decoder's checksum
+validates, and gets discarded. So it's "**decode every way, keep what checks
+out**," not "detect, then decode."
+
+### "Modulation" is really two separate layers
+| Step | What it resolves | How it's decided |
+|---|---|---|
+| **A. Demodulation** (AM/FM) | wave → amplitude or frequency trace | tried **both ways**, not detected |
+| **B. Line coding** (PWM/PPM/Manchester/…) | pulse *timings* → actual bits | each decoder applies its own known scheme |
+
+Between A and B is an intermediate form that isn't bits yet: **pulse/gap
+timings**. Bits appear only at step B.
+
+### Corrected sequence
+```
+raw wave (IQ)
+   → demodulate BOTH ways (AM and FM)        ← not "figure out", just try both
+      → pulse/gap timings
+         → each decoder applies its line code  ← this is where bits appear
+            → bits
+               → protocol match + CRC check    ← this confirms it was right
+                  → decoded message
+```
+
+### One-sentence version
+The program gets raw data about the wave, demodulates it **both as AM (for OOK)
+and as FM (for FSK)**, converts each into pulse timings, and then **each device
+decoder tries to turn those timings into ones and zeros using its own encoding**
+— the correct modulation and encoding are confirmed retroactively by whichever
+interpretation passes a CRC check. rtl_433 never *identifies* the modulation up
+front; it's a brute-force "try everything, trust the checksum" machine.
+
+---
+
+## Q11: Which part of the code does the demodulation?
+
+Demodulation lives in two files working together.
+
+| Role | File | What it does |
+|---|---|---|
+| **Orchestration** | `src/r_flow.c` (inside `push_sdr_flow`) | Decides which demod to run and calls them |
+| **The actual math** | `src/baseband.c` | Per-sample DSP: IQ → amplitude / frequency |
+
+Call flow: `push_sdr_flow()` (`r_flow.c`) → `envelope_detect_nolut` /
+`magnitude_est_*` / `baseband_demod_FM` (`baseband.c`).
+
+### AM demodulation (for OOK devices)
+Orchestrated at `src/r_flow.c:149–162`, then low-pass filtered at line 198. Picks
+one of three estimators:
+- **`envelope_detect_nolut`** — `src/baseband.c:49`
+- **`magnitude_est_cu8`** — `src/baseband.c:63`
+- **`magnitude_est_cs16`** — `src/baseband.c:92`
+
+`envelope_detect_nolut` (lines 49–59) is "how loud is the wave right now":
+```c
+int16_t x = 127 - iq_buf[2 * i];       // I component, centered
+int16_t y = 127 - iq_buf[2 * i + 1];   // Q component, centered
+y_buf[i]  = x * x + y * y;             // magnitude² = amplitude
+```
+Each `(I,Q)` pair → `I²+Q²`, the squared magnitude of the vector (the envelope).
+`magnitude_est_cu8` uses a fast `122*max + 51*min` approximation of `√(I²+Q²)` to
+avoid the slow sqrt. Result lands in **`demod->am_buf`** after the low-pass filter
+(line 198) — the AM trace that OOK pulse detection slices.
+
+### FM demodulation (for FSK devices)
+Orchestrated at `src/r_flow.c:201–210`, gated by `demod->enable_FM_demod` (only
+on if an FSK-capable decoder is registered). Calls:
+- **`baseband_demod_FM`** (CU8) — `src/baseband.c:204`
+- **`baseband_demod_FM_cs16`** (CS16) — `src/baseband.c:297`
+
+FM demod computes the *rate of change of the vector's angle* (instantaneous
+frequency = phase difference between consecutive IQ samples), not its length.
+Result lands in **`demod->buf.fm`** — the FM trace that FSK pulse detection
+slices.
+
+### How both feed forward
+Both buffers are produced (when FM is enabled) and handed together to the pulse
+detector at `r_flow.c:243`:
+```c
+package_type = pulse_detect_package(demod->pulse_detect, demod->am_buf, demod->buf.fm, n_samples, ...);
+```
+Passing **both `am_buf` and `fm_buf`** is exactly the "try both ways" design.
+
+### Summary
+- Demod **math:** `src/baseband.c` — `envelope_detect_nolut` / `magnitude_est_*`
+  (AM, line 49+) and `baseband_demod_FM*` (FM, line 204+).
+- Demod **orchestration:** `src/r_flow.c` inside `push_sdr_flow()` — AM at line
+  149, FM at line 201.
+- Core transform: each `(I,Q)` → `I²+Q²` (amplitude, for OOK) or phase
+  rate-of-change (frequency, for FSK). No bits yet.
+
+---
+
+## Q12: Which part of the code decides which demodulated data represents something valid?
+
+The decision happens at **two layers**, answering two different questions.
+
+### Layer 1 — "Is this burst OOK or FSK?" → the pulse detector
+**File `src/pulse_detect.c`, function `pulse_detect_package()` (line 199).**
+A state machine walks the demodulated samples watching the **AM envelope**
+(`envelope_data`) and the **FM trace** (`fm_data`) simultaneously, and returns:
+- **`PULSE_DATA_OOK`** (line 272) — the AM envelope had clean on/off pulses
+- **`PULSE_DATA_FSK`** (lines 253, 410) — the FM demod showed a clean frequency
+  shift between two levels
+
+The decision point (lines 386–387):
+```c
+// Determine if FSK modulation is detected
+if (fsk_pulses->num_pulses > PD_MIN_PULSES) {
+    ... return PULSE_DATA_FSK;
+```
+It declares FSK only if the FM demodulator accumulated a minimum number of clean
+frequency-shift pulses; otherwise the burst is treated as OOK. **No CRCs here —
+it's a signal-shape heuristic** that picks which demodulated buffer to pursue.
+The return value routes the burst (in `r_flow.c`) to `run_ook_demods` or
+`run_fsk_demods`. Lots of noise still passes this stage.
+
+### Layer 2 — "Are these bits a genuine message?" → device decoders + CRC
+The authoritative validity decision, across three levels:
+
+**(a) The runner** — `run_ook_demods` / `run_fsk_demods` in `src/r_api.c:438` /
+`:502`. Loops over every registered decoder, calls the right pulse slicer per
+decoder (lines 456–495), sums `p_events`, and **stops as soon as one returns an
+event** (line 444: `for (...; !p_events && ...)`).
+
+**(b) The slicer's accounting** — `account_event()` in `src/pulse_slicer.c:26`,
+the pivotal spot. It runs the decoder and interprets the return value:
+```c
+ret = device->decode_fn(device, bits);   // line 31 — run the device decoder
+...
+if (ret > 0) {                            // line 36 — VALID: decoder accepted it
+    device->decode_ok += 1;
+    device->decode_messages += ret;
+}
+else if (ret >= DECODE_FAIL_SANITY) {     // line 40 — rejected (e.g. CRC failed)
+    device->decode_fails[-ret] += 1;
+    ret = 0;                              // counts as "nothing valid"
+}
+```
+The **return value of `decode_fn` is the verdict**: `> 0` = a real validated
+message (number = how many); `<= 0` = not mine / failed validation.
+
+**(c) The device decoder** — `src/devices/*.c`. Each `decode_fn` runs the
+**CRC/checksum**. Convention: on failure/bad preamble/wrong length it returns
+`DECODE_FAIL_MIC` / `DECODE_ABORT_LENGTH` / etc. (all `<= 0`); on success it fills
+fields and returns a positive count. That positive return propagates up through
+`account_event` → `run_*_demods` → `p_events`, and is what makes rtl_433 emit
+output.
+
+### Where each decision lives
+```
+pulse_detect_package()        src/pulse_detect.c:199   → OOK vs FSK   (signal shape, PD_MIN_PULSES)
+   │ returns PULSE_DATA_OOK / PULSE_DATA_FSK
+run_ook_demods / run_fsk_demods  src/r_api.c:438/502   → try each decoder, stop on first event
+   │ calls pulse_slicer_* per decoder
+account_event()               src/pulse_slicer.c:26    → interprets decode_fn's return value
+   │ ret > 0 = valid, ret <= 0 = rejected
+device->decode_fn()           src/devices/*.c          → THE validity test: CRC / checksum / preamble
+```
+
+### Direct answer
+Two places, for two questions:
+1. **Which demodulated buffer (AM→OOK or FM→FSK) is structurally valid** is
+   decided by **`pulse_detect_package()` in `src/pulse_detect.c`** — by signal
+   shape, specifically whether it gathered enough clean FSK frequency-shift
+   pulses (`PD_MIN_PULSES`, line 387) vs. clean OOK envelope pulses.
+2. **Whether the resulting bits are a genuine message** is decided by **each
+   device decoder's `decode_fn` in `src/devices/*.c` via its CRC/checksum**, with
+   the gatekeeping logic in **`account_event()` at `src/pulse_slicer.c:36`**
+   (`ret > 0` = valid).
+
+The honest summary: the pulse detector makes a cheap structural guess about
+modulation, and then **the CRC inside each device decoder is the final arbiter**
+of whether the data was real — anything that doesn't pass a checksum is silently
+dropped.
